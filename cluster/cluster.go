@@ -15,6 +15,9 @@ package cluster
 import (
 	"errors"
 	"fmt"
+	"log"
+	"math/rand"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -115,6 +118,11 @@ func New(addr string) (*Cluster, error) {
 	return NewWithOpts(Opts{
 		Addr: addr,
 	})
+}
+
+func init() {
+	log.SetFlags(log.Lshortfile | log.Ldate | log.Ltime)
+	rand.Seed(time.Now().UnixNano())
 }
 
 // NewWithOpts is the same as NewCluster, but with more fine-tuned
@@ -227,7 +235,7 @@ func (c *Cluster) getConn(key, addr string) (*redis.Client, error) {
 
 		// If there's an error try one more time retrieving from a random pool
 		// before bailing
-		p = c.getRandomPoolInner()
+		p = c.getRandomPoolInner(-1)
 		if p == nil {
 			respCh <- &resp{err: errNoPools}
 			return
@@ -258,11 +266,21 @@ func (c *Cluster) Put(conn *redis.Client) {
 	}
 }
 
-func (c *Cluster) getRandomPoolInner() *pool.Pool {
-	for _, pool := range c.pools {
-		return pool
+func (c *Cluster) getRandomPoolInner(skip int) *pool.Pool {
+	var poolNames []string
+	for poolName := range c.pools {
+		poolNames = append(poolNames, poolName)
 	}
-	return nil
+	sort.Strings(poolNames)
+	log.Printf("Available pools: %#v", poolNames)
+
+	if skip < 0 || skip >= len(poolNames) {
+		skip = rand.Intn(len(poolNames))
+		log.Printf("Random Skip requested: %d", skip)
+	}
+
+	log.Printf("Random pool requested, returning %s skip: %d", poolNames[skip], skip)
+	return c.pools[poolNames[skip]]
 }
 
 // Reset will re-retrieve the cluster topology and set up/teardown connections
@@ -295,12 +313,23 @@ func (c *Cluster) resetInner() error {
 		c.resetThrottle = time.NewTicker(c.o.ResetThrottle)
 	}
 
-	p := c.getRandomPoolInner()
-	if p == nil {
-		return fmt.Errorf("no available nodes to call CLUSTER SLOTS on")
+	var err error
+	var p *pool.Pool
+	for i := 0; i < len(c.pools); i++ {
+		p = c.getRandomPoolInner(i)
+		if p == nil {
+			return fmt.Errorf("no available nodes to call CLUSTER SLOTS on")
+		}
+		err = c.resetInnerUsingPool(p)
+		if err == nil {
+			log.Printf("Reset Success: %s %s %s", err, p.Network, p.Addr)
+			return nil
+		}
+		log.Printf("Reset Err: %s %s %s", err, p.Network, p.Addr)
 	}
+	log.Printf("Reset Fail: %s %s %s", err, p.Network, p.Addr)
 
-	return c.resetInnerUsingPool(p)
+	return err
 }
 
 func (c *Cluster) resetInnerUsingPool(p *pool.Pool) error {
@@ -477,9 +506,10 @@ func (c *Cluster) clientCmd(
 
 	haveTriedBefore := haveTried(tried, client.Addr)
 	tried = justTried(tried, client.Addr)
-
+	log.Printf("Something Happened:(%s): %s (Tried: %#v)(Reset: %#v)", client.Addr, err, haveTriedBefore, haveReset)
 	// Deal with network error
 	if r.IsType(redis.IOErr) {
+		log.Printf("Network error %s(Tried: %#v)(Reset: %#v)", r, haveTriedBefore, haveReset)
 		// If this is the first time trying this node, try it again
 		if !haveTriedBefore {
 			if client, try2err := c.getConn("", client.Addr); try2err == nil {
@@ -488,16 +518,25 @@ func (c *Cluster) clientCmd(
 		}
 		// Otherwise try calling Reset() and getting a random client
 		if !haveReset {
+			log.Printf("Resetting with %s", c.Addr)
 			if resetErr := c.Reset(); resetErr != nil {
-				return errorRespf("Could not get cluster info: %s", resetErr)
+				return errorRespf("Could not get cluster info(network): %s", resetErr)
 			}
 			client, getErr := c.getConn("", "")
+
+			addr := "nil"
+			if client != nil {
+				addr = client.Addr
+			}
+			log.Printf("Got new connection to %s: %s", addr, getErr)
+
 			if getErr != nil {
 				return errorResp(getErr)
 			}
 			return c.clientCmd(client, cmd, args, false, tried, true)
 		}
 		// Otherwise give up and return the most recent error
+		log.Printf("Giving up and returning error: %s", err)
 		return r
 	}
 
@@ -507,6 +546,7 @@ func (c *Cluster) clientCmd(
 	ask = strings.HasPrefix(msg, "ASK ")
 	if moved || ask {
 		_, addr := redirectInfo(msg)
+		log.Printf("Redirect %#v", addr)
 		c.callCh <- func(c *Cluster) {
 			select {
 			case c.MissCh <- struct{}{}:
@@ -517,11 +557,13 @@ func (c *Cluster) clientCmd(
 		// If we've already called Reset and we're getting MOVED again than the
 		// cluster is having problems, likely telling us to try a node which is
 		// not reachable. Not much which can be done at this point
+		//	return errorRespf("Cluster doesn't make sense, %s might be gone", addr)
+		//}
 		if haveReset {
-			return errorRespf("Cluster doesn't make sense, %s might be gone", addr)
+			log.Printf("Cluster doesn't make sense, %s might be gone", addr)
 		}
 		if resetErr := c.Reset(); resetErr != nil {
-			return errorRespf("Could not get cluster info: %s", resetErr)
+			return errorRespf("Could not get cluster info(moved): %s", resetErr)
 		}
 		haveReset = true
 
@@ -538,6 +580,7 @@ func (c *Cluster) clientCmd(
 		return c.clientCmd(client, cmd, args, ask, tried, haveReset)
 	}
 
+	log.Printf("Normal Error: %s", err)
 	// It's a normal application error (like WRONG KEY TYPE or whatever), return
 	// that to the client
 	return r
