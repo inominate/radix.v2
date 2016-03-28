@@ -4,7 +4,7 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/mediocregopher/radix.v2/cluster"
+	"github.com/inominate/radix.v2/cluster"
 )
 
 func scanSingle(r Cmder, ch chan string, cmd, key, pattern string) error {

@@ -22,8 +22,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mediocregopher/radix.v2/pool"
-	"github.com/mediocregopher/radix.v2/redis"
+	"github.com/inominate/radix.v2/pool"
+	"github.com/inominate/radix.v2/redis"
 )
 
 const numSlots = 16384
@@ -518,7 +518,7 @@ func (c *Cluster) clientCmd(
 		}
 		// Otherwise try calling Reset() and getting a random client
 		if !haveReset {
-			log.Printf("Resetting with %s", c.Addr)
+			log.Printf("Resetting...")
 			if resetErr := c.Reset(); resetErr != nil {
 				return errorRespf("Could not get cluster info(network): %s", resetErr)
 			}
